@@ -1,0 +1,16 @@
+{
+  "$schema": "./sync-bot.config.schema.json",
+  "upstream": {
+    "owner": "RavelloH",
+    "repo": "InsightFlare",
+    "branch": "main"
+  },
+  "downstream": {
+    "syncBranch": "chore/sync-upstream",
+    "baseTag": "upstream-sync-base",
+    "prTitle": "chore: sync upstream RavelloH/InsightFlare",
+    "treeScanExclude": ["wrangler.toml"]
+  },
+  "maxParallel": 16,
+  "scheduleNote": "Edit the cron expression directly in .github/workflows/sync-fanout.yml — GitHub Actions does not support dynamic schedules."
+}

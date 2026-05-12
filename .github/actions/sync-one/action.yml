@@ -1,0 +1,510 @@
+name: Sync one downstream
+description: |
+  Performs a single upstream-to-downstream sync against one target repository.
+  Designed to be called from a matrix strategy in the bot's fan-out workflow.
+  All heavy logic (mode detection, base resolution, conflict handling, PR body
+  generation) is ported from the legacy in-repo `sync-upstream.yml` so the
+  user-facing PR output is identical.
+
+inputs:
+  target-owner:
+    description: Owner login of the downstream repo to sync into.
+    required: true
+  target-repo:
+    description: Name of the downstream repo to sync into.
+    required: true
+  target-default-branch:
+    description: Default branch of the downstream repo (the PR base).
+    required: true
+  target-token:
+    description: GitHub App installation token scoped to just this target repo.
+    required: true
+  config-path:
+    description: Path (relative to the bot repo root) to sync-bot.config.json.
+    required: false
+    default: sync-bot.config.json
+
+runs:
+  using: composite
+  steps:
+    - name: Load config
+      shell: bash
+      env:
+        CONFIG_PATH_INPUT: ${{ inputs.config-path }}
+      run: |
+        CONFIG="$GITHUB_WORKSPACE/$CONFIG_PATH_INPUT"
+        if [ ! -f "$CONFIG" ]; then
+          echo "::error::Config file not found at $CONFIG"
+          exit 1
+        fi
+
+        UPSTREAM_OWNER=$(jq -r '.upstream.owner' "$CONFIG")
+        UPSTREAM_REPO_NAME=$(jq -r '.upstream.repo' "$CONFIG")
+        UPSTREAM_BRANCH=$(jq -r '.upstream.branch' "$CONFIG")
+        SYNC_BRANCH=$(jq -r '.downstream.syncBranch' "$CONFIG")
+        BASE_TAG=$(jq -r '.downstream.baseTag' "$CONFIG")
+        PR_TITLE=$(jq -r '.downstream.prTitle' "$CONFIG")
+        TREE_SCAN_EXCLUDE=$(jq -r '.downstream.treeScanExclude | map(":!" + .) | join(" ")' "$CONFIG")
+
+        {
+          echo "UPSTREAM_OWNER=$UPSTREAM_OWNER"
+          echo "UPSTREAM_REPO_NAME=$UPSTREAM_REPO_NAME"
+          echo "UPSTREAM_REPO=$UPSTREAM_OWNER/$UPSTREAM_REPO_NAME"
+          echo "UPSTREAM_BRANCH=$UPSTREAM_BRANCH"
+          echo "SYNC_BRANCH=$SYNC_BRANCH"
+          echo "BASE_TAG=$BASE_TAG"
+          echo "PR_TITLE=$PR_TITLE"
+          echo "TREE_SCAN_EXCLUDE=$TREE_SCAN_EXCLUDE"
+        } >> "$GITHUB_ENV"
+
+        echo "Loaded config for $UPSTREAM_OWNER/$UPSTREAM_REPO_NAME (branch $UPSTREAM_BRANCH)."
+
+    - name: Clone target repo
+      shell: bash
+      env:
+        TARGET_OWNER: ${{ inputs.target-owner }}
+        TARGET_REPO: ${{ inputs.target-repo }}
+        TARGET_TOKEN: ${{ inputs.target-token }}
+      run: |
+        # x-access-token is the GitHub-recommended username for installation
+        # token https auth. Token is auto-redacted in logs by Actions because
+        # it was passed via `secrets.*` -> step output -> input.
+        git clone \
+          --no-tags \
+          "https://x-access-token:${TARGET_TOKEN}@github.com/${TARGET_OWNER}/${TARGET_REPO}.git" \
+          target
+        echo "Cloned ${TARGET_OWNER}/${TARGET_REPO} into ./target"
+
+    - name: Configure git identity
+      shell: bash
+      working-directory: target
+      run: |
+        # Commits are authored as the GitHub App's bot user. The numeric ID
+        # ensures GitHub renders the avatar correctly. We use the
+        # generic "actions" email shape — replaced if the App provides a
+        # better identity via the token claims (not exposed in v1).
+        git config user.name 'sync-upstream-bot[bot]'
+        git config user.email 'sync-upstream-bot@users.noreply.github.com'
+
+    - name: Add upstream remote and fetch
+      shell: bash
+      working-directory: target
+      run: |
+        git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+        git fetch upstream "${UPSTREAM_BRANCH}" --no-recurse-submodules
+        # Fetch the base-tracking tag if it exists from a previous run.
+        # 2>/dev/null hides "no such ref" on first sync of a new target.
+        git fetch origin "refs/tags/${BASE_TAG}:refs/tags/${BASE_TAG}" 2>/dev/null || true
+
+    - name: Detect sync mode and base
+      id: base
+      shell: bash
+      working-directory: target
+      env:
+        DEFAULT_BRANCH: ${{ inputs.target-default-branch }}
+      run: |
+        # Three repository shapes are supported:
+        #   * Fork — created via GitHub's Fork button. Full git history,
+        #     shares a merge-base with upstream.
+        #   * Clean clone — `git clone` + `git remote set-url`. Same as
+        #     fork structurally: full history, shares a merge-base.
+        #   * Snapshot clone — created via Cloudflare's "Deploy to
+        #     Cloudflare" button. A single `source repo import` commit
+        #     by cloudflare[bot], no shared history with upstream.
+        #
+        # Mode is chosen by whether `git merge-base` finds shared history:
+        #   * yes  -> mode=merge: regular `git merge --no-ff`, preserves
+        #              upstream commit history in the user's repo.
+        #   * no   -> mode=squash: tree-match to recover the virtual base,
+        #              apply diff as a single squash commit via
+        #              `git apply --3way`. Avoids dumping all of upstream's
+        #              history into a snapshot-clone repository.
+
+        MERGE_BASE="$(git merge-base "origin/${DEFAULT_BRANCH}" "upstream/${UPSTREAM_BRANCH}" 2>/dev/null || true)"
+
+        if [ -n "${MERGE_BASE}" ]; then
+          MODE=merge
+          BASE_SHA="${MERGE_BASE}"
+          RESOLVED_FROM=merge-base
+          echo "Shared git history detected (merge-base ${BASE_SHA:0:7}). Using MERGE mode."
+        else
+          MODE=squash
+          if git rev-parse --verify --quiet "refs/tags/${BASE_TAG}^{commit}" > /dev/null; then
+            BASE_SHA="$(git rev-parse "refs/tags/${BASE_TAG}^{commit}")"
+            RESOLVED_FROM=tag
+            echo "Snapshot clone detected. Using SQUASH mode with base from \`${BASE_TAG}\` tag (${BASE_SHA:0:7})."
+          else
+            echo "Snapshot clone detected and no \`${BASE_TAG}\` tag. Scanning upstream for a matching tree..."
+            BASE_SHA=""
+            for sha in $(git rev-list "upstream/${UPSTREAM_BRANCH}" --max-count=1000); do
+              # shellcheck disable=SC2086
+              if git diff --quiet HEAD "$sha" -- . ${TREE_SCAN_EXCLUDE}; then
+                BASE_SHA="$sha"
+                break
+              fi
+            done
+            if [ -z "${BASE_SHA}" ]; then
+              echo "::error::Could not auto-resolve the upstream base commit. The local HEAD tree did not match any of the last 1000 upstream commits. Please create a tag manually: \`git tag ${BASE_TAG} <upstream-sha-at-deploy-time> && git push origin ${BASE_TAG}\`."
+              exit 1
+            fi
+            RESOLVED_FROM=scan
+            echo "Tree-match found upstream commit ${BASE_SHA:0:7}. Using SQUASH mode."
+          fi
+        fi
+
+        {
+          echo "mode=${MODE}"
+          echo "base_sha=${BASE_SHA}"
+          echo "base_short=${BASE_SHA:0:7}"
+          echo "resolved_from=${RESOLVED_FROM}"
+          echo "default_branch=${DEFAULT_BRANCH}"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Compute sync range
+      id: range
+      shell: bash
+      working-directory: target
+      run: |
+        DEFAULT_BRANCH='${{ steps.base.outputs.default_branch }}'
+        BASE_SHA='${{ steps.base.outputs.base_sha }}'
+        MODE='${{ steps.base.outputs.mode }}'
+        HEAD_SHA="$(git rev-parse "upstream/${UPSTREAM_BRANCH}")"
+
+        echo "default_branch=${DEFAULT_BRANCH}" >> "$GITHUB_OUTPUT"
+
+        if [ "$BASE_SHA" = "$HEAD_SHA" ]; then
+          echo "Upstream is already at the synced base (${BASE_SHA:0:7}). Nothing to do."
+          echo "has_changes=false" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        if [ "$MODE" = "merge" ] && git merge-base --is-ancestor "$HEAD_SHA" "origin/${DEFAULT_BRANCH}"; then
+          echo "Upstream HEAD is already an ancestor of origin/${DEFAULT_BRANCH}. Nothing to do."
+          echo "has_changes=false" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        COMMIT_COUNT="$(git rev-list --count --no-merges "${BASE_SHA}..${HEAD_SHA}")"
+        {
+          echo "head_sha=${HEAD_SHA}"
+          echo "head_short=${HEAD_SHA:0:7}"
+          echo "commit_count=${COMMIT_COUNT}"
+          echo "has_changes=true"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Prepare sync branch
+      id: prepare
+      if: steps.range.outputs.has_changes == 'true'
+      shell: bash
+      working-directory: target
+      env:
+        RUN_ID: ${{ github.run_id }}
+      run: |
+        DEFAULT_BRANCH='${{ steps.range.outputs.default_branch }}'
+        MODE='${{ steps.base.outputs.mode }}'
+        BASE_SHA='${{ steps.base.outputs.base_sha }}'
+        HEAD_SHA='${{ steps.range.outputs.head_sha }}'
+        HEAD_SHORT='${{ steps.range.outputs.head_short }}'
+        COUNT='${{ steps.range.outputs.commit_count }}'
+
+        git checkout -B "${SYNC_BRANCH}" "origin/${DEFAULT_BRANCH}"
+
+        HAS_CONFLICTS=false
+        CONFLICT_FILES=""
+
+        if [ "${MODE}" = "merge" ]; then
+          # Fork / clean clone — preserve upstream commit history via
+          # a real merge commit. Two parents: origin/<default> and
+          # upstream/<branch>.
+          MERGE_TITLE="chore: sync upstream ${UPSTREAM_REPO}@${HEAD_SHORT}"
+          MERGE_BODY="$(printf 'Merges %s upstream commit(s) from %s..%s into %s.\n\nAuto-merged by sync-upstream bot (run #%s).' \
+            "${COUNT}" "${BASE_SHA:0:7}" "${HEAD_SHORT}" "${DEFAULT_BRANCH}" "${RUN_ID}")"
+
+          if ! git merge --no-ff "upstream/${UPSTREAM_BRANCH}" -m "${MERGE_TITLE}" -m "${MERGE_BODY}"; then
+            CONFLICT_FILES="$(git diff --name-only --diff-filter=U)"
+            HAS_CONFLICTS=true
+            git add -A
+            git commit -m "${MERGE_TITLE} (with conflicts)" -m "${MERGE_BODY}
+
+        ⚠️ Conflicts in: $(echo "${CONFLICT_FILES}" | tr '\n' ' ')
+
+        Resolve the <<<<<<< markers manually before merging this PR."
+          fi
+        else
+          # Snapshot clone — no shared history. Apply BASE..HEAD as a
+          # single squash commit using `git apply --3way`. Avoids pulling
+          # the entire upstream history into a one-commit repo.
+          PATCH_FILE="$(mktemp)"
+          git diff --binary "${BASE_SHA}" "upstream/${UPSTREAM_BRANCH}" > "${PATCH_FILE}"
+
+          if [ ! -s "${PATCH_FILE}" ]; then
+            echo "Empty patch produced. Treating as no-op."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "has_conflicts=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          APPLY_RC=0
+          git apply --3way --whitespace=nowarn "${PATCH_FILE}" || APPLY_RC=$?
+          git add -A
+
+          CONFLICT_FILES="$(git grep --cached -l -E '^<<<<<<< ' -- . 2>/dev/null || true)"
+          if [ -n "${CONFLICT_FILES}" ]; then
+            HAS_CONFLICTS=true
+          fi
+
+          if [ "${APPLY_RC}" != "0" ] && [ "${HAS_CONFLICTS}" = "false" ]; then
+            echo "::error::git apply exited ${APPLY_RC} but no conflict markers were produced. Patch likely could not be applied at all. Aborting."
+            exit 1
+          fi
+
+          SQUASH_BODY="Squashes ${COUNT} upstream commit(s) from ${BASE_SHA:0:7}..${HEAD_SHORT}.
+
+        Auto-applied by sync-upstream bot (run #${RUN_ID})."
+
+          if [ "${HAS_CONFLICTS}" = "true" ]; then
+            SQUASH_TITLE="chore: sync upstream ${UPSTREAM_REPO}@${HEAD_SHORT} (with conflicts)"
+            SQUASH_BODY="${SQUASH_BODY}
+
+        ⚠️ Conflicts in: $(echo "${CONFLICT_FILES}" | tr '\n' ' ')
+
+        Resolve the <<<<<<< markers manually before merging this PR."
+          else
+            SQUASH_TITLE="chore: sync upstream ${UPSTREAM_REPO}@${HEAD_SHORT}"
+          fi
+
+          git commit --allow-empty -m "${SQUASH_TITLE}" -m "${SQUASH_BODY}"
+        fi
+
+        # Persist conflict list for the PR body step.
+        printf '%s\n' "${CONFLICT_FILES}" > /tmp/conflict-files.txt
+
+        echo "has_conflicts=${HAS_CONFLICTS}" >> "$GITHUB_OUTPUT"
+        echo "skip=false" >> "$GITHUB_OUTPUT"
+
+    - name: Force-push sync branch
+      if: steps.range.outputs.has_changes == 'true' && steps.prepare.outputs.skip != 'true'
+      shell: bash
+      working-directory: target
+      run: |
+        git push --force-with-lease origin "${SYNC_BRANCH}"
+
+    - name: Build PR body
+      if: steps.range.outputs.has_changes == 'true'
+      shell: bash
+      working-directory: target
+      env:
+        TARGET_OWNER: ${{ inputs.target-owner }}
+        TARGET_REPO: ${{ inputs.target-repo }}
+        BOT_REPOSITORY: ${{ github.repository }}
+        BOT_SERVER_URL: ${{ github.server_url }}
+        RUN_ID: ${{ github.run_id }}
+      run: |
+        BASE='${{ steps.base.outputs.base_sha }}'
+        BASE_SHORT='${{ steps.base.outputs.base_short }}'
+        BASE_RESOLVED_FROM='${{ steps.base.outputs.resolved_from }}'
+        MODE='${{ steps.base.outputs.mode }}'
+        HEAD='${{ steps.range.outputs.head_sha }}'
+        HEAD_SHORT='${{ steps.range.outputs.head_short }}'
+        COUNT='${{ steps.range.outputs.commit_count }}'
+        DEFAULT_BRANCH='${{ steps.range.outputs.default_branch }}'
+        HAS_CONFLICTS='${{ steps.prepare.outputs.has_conflicts }}'
+        NOW="$(date -u '+%Y-%m-%d %H:%M UTC')"
+        RUN_URL="${BOT_SERVER_URL}/${BOT_REPOSITORY}/actions/runs/${RUN_ID}"
+        COMPARE_URL="https://github.com/${UPSTREAM_REPO}/compare/${BASE_SHORT}...${HEAD_SHORT}"
+        WORKFLOW_URL="${BOT_SERVER_URL}/${BOT_REPOSITORY}/blob/HEAD/.github/workflows/sync-fanout.yml"
+
+        TOTAL_COMMITS="$(git rev-list --count --no-merges "${BASE}..${HEAD}")"
+        TOTAL_FILES="$(git diff --name-only "${BASE}..${HEAD}" | wc -l | tr -d ' ')"
+
+        case "${BASE_RESOLVED_FROM}" in
+          merge-base) BASE_NOTE="via shared git history (\`git merge-base\`)" ;;
+          tag)        BASE_NOTE="from \`${BASE_TAG}\` tag (set by a previous sync)" ;;
+          scan)       BASE_NOTE="auto-detected via tree match" ;;
+          *)          BASE_NOTE="" ;;
+        esac
+
+        if [ "${MODE}" = "merge" ]; then
+          MODE_NOTE="This repository has shared git history with the upstream (fork or clean clone), so the changes are applied as a regular **merge commit** — upstream commit history and authorship are preserved."
+        else
+          MODE_NOTE="This repository has no shared git history with the upstream (e.g., created via Cloudflare's *Deploy to Cloudflare* button, which produces a single snapshot commit). The changes are applied as a single **squashed commit** via \`git apply --3way\` to avoid pulling all of upstream's history into a one-commit repository. Per-commit authorship is preserved below in the *Incoming commits* section."
+        fi
+
+        {
+          echo "This pull request is automatically maintained by the [\`${BOT_REPOSITORY}\`](${BOT_SERVER_URL}/${BOT_REPOSITORY}) sync bot (see [\`sync-fanout.yml\`](${WORKFLOW_URL})). It pulls the latest changes from the upstream repository [\`${UPSTREAM_REPO}\`](https://github.com/${UPSTREAM_REPO}) (\`${UPSTREAM_BRANCH}\` branch) into this repository so that your deployment stays in sync."
+          echo ""
+          echo "> ℹ️ ${MODE_NOTE}"
+          echo ""
+
+          if [ "${HAS_CONFLICTS}" = "true" ]; then
+            echo "## ⚠️ Conflicts detected"
+            echo ""
+            echo "Some files could not be merged automatically. The following files contain \`<<<<<<<\` / \`=======\` / \`>>>>>>>\` markers and **must be resolved before merging**:"
+            echo ""
+            while IFS= read -r f; do
+              [ -z "$f" ] && continue
+              echo "- \`${f}\`"
+            done < /tmp/conflict-files.txt
+            echo ""
+            echo "To resolve locally:"
+            echo ""
+            echo "\`\`\`bash"
+            echo "git fetch origin ${SYNC_BRANCH}"
+            echo "git checkout ${SYNC_BRANCH}"
+            echo "# edit the files above, remove conflict markers"
+            echo "git add -A && git commit --amend --no-edit"
+            echo "git push --force-with-lease"
+            echo "\`\`\`"
+            echo ""
+          fi
+
+          echo "## Sync details"
+          echo ""
+          echo "| Field | Value |"
+          echo "| --- | --- |"
+          echo "| Upstream repository | [\`${UPSTREAM_REPO}\`](https://github.com/${UPSTREAM_REPO}) |"
+          echo "| Upstream branch | \`${UPSTREAM_BRANCH}\` |"
+          echo "| Sync mode | \`${MODE}\` (${BASE_NOTE}) |"
+          echo "| Base (upstream commit at deploy/last sync) | [\`${BASE_SHORT}\`](https://github.com/${UPSTREAM_REPO}/commit/${BASE}) |"
+          echo "| Head (upstream \`${UPSTREAM_BRANCH}\`) | [\`${HEAD_SHORT}\`](https://github.com/${UPSTREAM_REPO}/commit/${HEAD}) |"
+          echo "| New commits | **${COUNT}** |"
+          echo "| Files changed | **${TOTAL_FILES}** |"
+          echo "| Last synced at | \`${NOW}\` |"
+          echo "| Bot run | [#${RUN_ID}](${RUN_URL}) |"
+          echo "| Compare on upstream | [\`${BASE_SHORT}…${HEAD_SHORT}\`](${COMPARE_URL}) |"
+          echo ""
+          echo "## Incoming commits"
+          echo ""
+          git log --no-merges --pretty=format:"%H%x09%s%x09%an%x09%ae" "${BASE}..${HEAD}" \
+            | head -50 \
+            | awk -F'\t' -v repo="${UPSTREAM_REPO}" '
+                {
+                  sha = $1; msg = $2; author_name = $3; email = $4
+                  gsub(/\[/, "\\[", msg)
+                  gsub(/\]/, "\\]", msg)
+                  user = ""
+                  if (email ~ /@users\.noreply\.github\.com$/) {
+                    user_part = email
+                    sub(/@users\.noreply\.github\.com$/, "", user_part)
+                    sub(/^[0-9]+\+/, "", user_part)
+                    if (length(user_part) > 0) user = user_part
+                  }
+                  if (length(user) > 0 && user !~ /(\[|\])/) {
+                    printf "- [%s](https://github.com/%s/commit/%s) by [@%s](https://github.com/%s)\n", msg, repo, sha, user, user
+                  } else {
+                    printf "- [%s](https://github.com/%s/commit/%s) by %s\n", msg, repo, sha, author_name
+                  }
+                }
+              '
+          echo ""
+          if [ "${TOTAL_COMMITS}" -gt 50 ]; then
+            echo ""
+            echo "_…and $((TOTAL_COMMITS - 50)) more commits. See the [compare view](${COMPARE_URL}) for the full list._"
+          fi
+          echo ""
+          echo "## Files changed"
+          echo ""
+          git diff --name-status "${BASE}..${HEAD}" | head -30 | awk -v repo="${UPSTREAM_REPO}" '{
+            status = $1;
+            path = $2;
+            label = "changed";
+            if (status == "A") label = "added";
+            else if (status == "M") label = "modified";
+            else if (status == "D") label = "deleted";
+            else if (substr(status, 1, 1) == "R") { label = "renamed"; path = $2 " → " $3 }
+            else if (substr(status, 1, 1) == "C") { label = "copied"; path = $2 " → " $3 }
+            printf "- `%s` — %s\n", path, label;
+          }'
+          if [ "${TOTAL_FILES}" -gt 30 ]; then
+            echo ""
+            echo "_…and $((TOTAL_FILES - 30)) more files. See the [compare view](${COMPARE_URL}) for the full diff._"
+          fi
+          echo ""
+          echo "## Review checklist before merging"
+          echo ""
+          echo "- [ ] **\`wrangler.toml\`** — if the upstream modified this file, make sure your local values for \`database_id\`, KV \`id\`, and any custom \`[env.*]\` sections are preserved (not overwritten with upstream placeholders)."
+          echo "- [ ] **\`migrations/\`** — any new SQL files will be applied automatically on the next \`npm run deploy\`. Confirm they are compatible with your D1 instance."
+          echo "- [ ] **Secrets / environment variables** — check whether the upstream introduced new required values (scan the diff for \`BOOTSTRAP_\`, \`SECRET\`, \`process.env.\`) and configure them in Cloudflare before deploying."
+          echo "- [ ] **Breaking changes** — scan the commit messages above for \`BREAKING CHANGE\`, major version bumps, or schema-affecting refactors."
+          echo ""
+          echo "## How to handle this PR"
+          echo ""
+          echo "| Action | What to do |"
+          echo "| --- | --- |"
+          echo "| Accept the update | Review the diff and click **Merge**. The next \`npm run deploy\` will apply the changes. |"
+          echo "| Skip this round | Close this PR. If the upstream gets further commits later, the bot will reopen and force-refresh it. |"
+          echo "| Disable sync entirely | Uninstall the GitHub App from this repository under *Settings → Integrations → Applications*. |"
+          echo "| Resolve conflicts locally | \`git fetch origin ${SYNC_BRANCH} && git checkout ${SYNC_BRANCH} && git rebase ${DEFAULT_BRANCH} && git push --force-with-lease\` |"
+          echo ""
+          echo "> ⚠️ The \`${SYNC_BRANCH}\` branch is force-updated on every sync run (\`push --force-with-lease\`). Do not commit directly to it — your changes will be overwritten on the next sync."
+        } > /tmp/pr_body.md
+
+        echo "Wrote $(wc -l < /tmp/pr_body.md) lines to /tmp/pr_body.md."
+
+    - name: Create or update PR
+      if: steps.range.outputs.has_changes == 'true'
+      shell: bash
+      working-directory: target
+      env:
+        GH_TOKEN: ${{ inputs.target-token }}
+        TARGET_OWNER: ${{ inputs.target-owner }}
+        TARGET_REPO: ${{ inputs.target-repo }}
+      run: |
+        DEFAULT_BRANCH='${{ steps.range.outputs.default_branch }}'
+
+        # Scope `gh` to the target repo explicitly. By default `gh` infers
+        # from `origin`, which we set during clone, but being explicit is
+        # cheaper than debugging a stray "could not find repo" later.
+        REPO_FLAG="--repo ${TARGET_OWNER}/${TARGET_REPO}"
+
+        # shellcheck disable=SC2086
+        PR_DATA="$(gh pr list $REPO_FLAG --head "${SYNC_BRANCH}" --state all --json number,state)"
+        PR_NUMBER="$(echo "${PR_DATA}" | jq -r '[.[] | select(.state == "OPEN" or .state == "CLOSED")] | .[0].number // ""')"
+
+        if [ -z "${PR_NUMBER}" ]; then
+          # shellcheck disable=SC2086
+          gh pr create $REPO_FLAG \
+            --head "${SYNC_BRANCH}" \
+            --base "${DEFAULT_BRANCH}" \
+            --title "${PR_TITLE}" \
+            --body-file /tmp/pr_body.md
+          echo "Created new sync PR in ${TARGET_OWNER}/${TARGET_REPO}."
+        else
+          PR_STATE="$(echo "${PR_DATA}" | jq -r --argjson n "${PR_NUMBER}" '[.[] | select(.number == $n)] | .[0].state // ""')"
+          if [ "${PR_STATE}" = "CLOSED" ]; then
+            # shellcheck disable=SC2086
+            gh pr reopen $REPO_FLAG "${PR_NUMBER}"
+            echo "Reopened PR #${PR_NUMBER} in ${TARGET_OWNER}/${TARGET_REPO}."
+          fi
+          # shellcheck disable=SC2086
+          gh pr edit $REPO_FLAG "${PR_NUMBER}" \
+            --title "${PR_TITLE}" \
+            --body-file /tmp/pr_body.md
+          echo "Updated PR #${PR_NUMBER} in ${TARGET_OWNER}/${TARGET_REPO}."
+        fi
+
+    - name: Update upstream-sync-base tag
+      if: steps.range.outputs.has_changes == 'true' && steps.prepare.outputs.skip != 'true'
+      shell: bash
+      working-directory: target
+      run: |
+        # Move the tag to the upstream HEAD we just synced against. Next run
+        # reads this tag instead of scanning trees, making subsequent syncs
+        # cheap and unambiguous. The tag lives on the target repo (not the
+        # upstream), so it persists across bot runs.
+        HEAD_SHA='${{ steps.range.outputs.head_sha }}'
+        git tag -f "${BASE_TAG}" "${HEAD_SHA}"
+        git push origin --force "refs/tags/${BASE_TAG}"
+        echo "Tagged ${BASE_TAG} → ${HEAD_SHA:0:7}."
+
+    - name: Seed upstream-sync-base tag (no upstream changes)
+      if: steps.range.outputs.has_changes == 'false' && steps.base.outputs.resolved_from == 'scan'
+      shell: bash
+      working-directory: target
+      run: |
+        # First run that found nothing new to sync, but resolved the base via
+        # tree scan. Persist the tag so we never scan again.
+        BASE_SHA='${{ steps.base.outputs.base_sha }}'
+        git tag -f "${BASE_TAG}" "${BASE_SHA}"
+        git push origin --force "refs/tags/${BASE_TAG}"
+        echo "Seeded ${BASE_TAG} → ${BASE_SHA:0:7} (no upstream changes this run)."

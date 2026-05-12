@@ -1,0 +1,99 @@
+name: Sync upstream fanout
+
+on:
+  schedule:
+    # Every 6 hours, at :13 past the hour (avoids the :00 thundering herd).
+    - cron: '13 */6 * * *'
+  workflow_dispatch:
+  # Triggered by the upstream repo's `on: push` workflow via
+  # `gh api repos/<bot-owner>/<bot-repo>/dispatches -f event_type=upstream-pushed`.
+  # See README for the snippet to add to the upstream repo.
+  repository_dispatch:
+    types: [upstream-pushed]
+
+# The fan-out workflow itself only touches THIS repo's metadata in passing
+# (caches, summaries). Granting nothing keeps the blast radius tight if
+# something inside the matrix tries to use GITHUB_TOKEN by mistake — the
+# actual cross-repo writes happen with installation tokens we mint per job.
+permissions: {}
+
+concurrency:
+  # Don't cancel an in-flight fanout — a half-finished run could leave a
+  # downstream repo with a force-pushed branch but no PR. Queue instead.
+  group: sync-fanout
+  cancel-in-progress: false
+
+jobs:
+  enumerate:
+    name: Enumerate installations
+    runs-on: ubuntu-latest
+    outputs:
+      targets: ${{ steps.list.outputs.targets }}
+      count: ${{ steps.list.outputs.count }}
+    steps:
+      - name: Checkout bot repo
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Install deps
+        run: npm ci
+
+      - name: Read upstream from config
+        id: cfg
+        run: |
+          OWNER=$(jq -r '.upstream.owner' sync-bot.config.json)
+          REPO=$(jq -r '.upstream.repo' sync-bot.config.json)
+          {
+            echo "owner=${OWNER}"
+            echo "repo=${REPO}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: List installations and their repos
+        id: list
+        env:
+          SYNC_APP_ID: ${{ secrets.SYNC_APP_ID }}
+          SYNC_APP_PRIVATE_KEY: ${{ secrets.SYNC_APP_PRIVATE_KEY }}
+          UPSTREAM_OWNER: ${{ steps.cfg.outputs.owner }}
+          UPSTREAM_REPO: ${{ steps.cfg.outputs.repo }}
+        run: node scripts/enumerate-installations.mjs
+
+  sync:
+    name: ${{ matrix.target.full_name }}
+    needs: enumerate
+    if: needs.enumerate.outputs.count != '0'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: ${{ fromJson(needs.enumerate.outputs.targets) }}
+      max-parallel: 16
+      fail-fast: false
+    steps:
+      - name: Checkout bot repo
+        # Needed so the composite action at `.github/actions/sync-one`
+        # is on disk for `uses: ./...` to resolve.
+        uses: actions/checkout@v4
+
+      - name: Mint installation token
+        uses: actions/create-github-app-token@v1
+        id: token
+        with:
+          app-id: ${{ secrets.SYNC_APP_ID }}
+          private-key: ${{ secrets.SYNC_APP_PRIVATE_KEY }}
+          # Scope the token to JUST this target repo. An exfiltrated token
+          # then only compromises one user, not the whole fleet.
+          owner: ${{ matrix.target.owner }}
+          repositories: ${{ matrix.target.repo }}
+
+      - name: Sync one target
+        uses: ./.github/actions/sync-one
+        with:
+          target-owner: ${{ matrix.target.owner }}
+          target-repo: ${{ matrix.target.repo }}
+          target-default-branch: ${{ matrix.target.default_branch }}
+          target-token: ${{ steps.token.outputs.token }}
+          config-path: sync-bot.config.json
