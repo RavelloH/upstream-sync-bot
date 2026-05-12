@@ -209,7 +209,7 @@ When the bot runs against your repo, it:
    - **`squash` mode** — snapshot clone (no shared history, e.g., Cloudflare "Deploy to" button output). The bot squashes the upstream diff into one commit applied via `git apply --3way`.
 2. Force-pushes the result to `chore/sync-upstream`.
 3. Creates the PR or, if `chore/sync-upstream` already has a PR (open or closed), updates that PR's title and body in place.
-4. Tags the upstream commit it synced against as `upstream-sync-base` in your repo, so the next run knows where to pick up.
+4. If the sync applied cleanly, tags the upstream commit it synced against as `upstream-sync-base` in your repo, so the next run knows where to pick up. Conflict PRs do not advance this tag because the target repo has not accepted that upstream tree yet.
 
 Conflicts: if `git apply --3way` or `git merge` produce conflict markers, or if a snapshot-clone patch cannot be fully applied and leaves `.rej` files, the bot still pushes the branch and opens the PR. The PR body lists which files need manual resolution. Resolve them on `chore/sync-upstream` and the workflow will pick up the resolved tree on the next run.
 

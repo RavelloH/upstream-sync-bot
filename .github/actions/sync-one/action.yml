@@ -671,14 +671,14 @@ runs:
         fi
 
     - name: Update upstream-sync-base tag
-      if: steps.range.outputs.has_changes == 'true' && steps.prepare.outputs.skip != 'true'
+      if: steps.range.outputs.has_changes == 'true' && steps.prepare.outputs.skip != 'true' && steps.prepare.outputs.has_conflicts != 'true'
       shell: bash
       working-directory: target
       run: |
-        # Move the tag to the upstream HEAD we just synced against. Next run
-        # reads this tag instead of scanning trees, making subsequent syncs
-        # cheap and unambiguous. The tag lives on the target repo (not the
-        # upstream), so it persists across bot runs.
+        # Move the tag only after a cleanly-applied sync. If the PR contains
+        # conflict markers or rejected hunks, the target repo has not actually
+        # accepted the upstream tree yet; advancing the cursor would make the
+        # next run diff from the wrong base.
         HEAD_SHA='${{ steps.range.outputs.head_sha }}'
         git tag -f "${BASE_TAG}" "${HEAD_SHA}"
         git push origin --force "refs/tags/${BASE_TAG}"
