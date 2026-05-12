@@ -1,5 +1,7 @@
 # upstream-sync-bot
 
+> Template source: <https://github.com/RavelloH/upstream-sync-bot>
+
 Template GitHub repository for running a **"sync from upstream → fan out to every downstream fork"** bot driven by a GitHub App.
 
 Downstream users install the App once. After that they receive automated pull requests with upstream changes — no PAT, no `.github/workflows/`, no settings toggles, no scripts to run.
@@ -208,4 +210,4 @@ Conflicts: if `git apply --3way` or `git merge` produce conflict markers, the bo
 
 ## License
 
-This template ships without a license. Decide one for your bot instance based on your project's needs (most users will want MIT or Apache-2.0).
+Licensed under the [MIT License](./LICENSE). Forks and bot instances generated from this template inherit MIT unless you replace the `LICENSE` file with something else.
