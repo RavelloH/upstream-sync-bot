@@ -67,6 +67,12 @@ jobs:
     needs: enumerate
     if: needs.enumerate.outputs.count != '0'
     runs-on: ubuntu-latest
+    permissions:
+      # Lets the matrix job's GITHUB_TOKEN read PUBLIC repo metadata
+      # (used to look up upstream commit author logins for PR body
+      # rendering). Cross-repo writes still happen via the per-target
+      # installation token, which is unaffected by this grant.
+      contents: read
     strategy:
       matrix:
         target: ${{ fromJson(needs.enumerate.outputs.targets) }}
@@ -96,4 +102,7 @@ jobs:
           target-repo: ${{ matrix.target.repo }}
           target-default-branch: ${{ matrix.target.default_branch }}
           target-token: ${{ steps.token.outputs.token }}
+          # Bot repo's GITHUB_TOKEN — used by sync-one only to read upstream
+          # commit metadata for author-login resolution. No write scope.
+          upstream-read-token: ${{ secrets.GITHUB_TOKEN }}
           config-path: sync-bot.config.json

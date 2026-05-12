@@ -19,6 +19,15 @@ inputs:
   target-token:
     description: GitHub App installation token scoped to just this target repo.
     required: true
+  upstream-read-token:
+    description: |
+      Token used to look up upstream commit metadata (author logins) for the
+      PR body's "Incoming commits" section. Typically the workflow's
+      `${{ secrets.GITHUB_TOKEN }}` — it can read public-repo metadata
+      without further setup. If the upstream is private, supply an
+      installation token that has access to it instead.
+    required: false
+    default: ""
   config-path:
     description: Path (relative to the bot repo root) to sync-bot.config.json.
     required: false
@@ -45,6 +54,12 @@ runs:
         BASE_TAG=$(jq -r '.downstream.baseTag' "$CONFIG")
         PR_TITLE=$(jq -r '.downstream.prTitle' "$CONFIG")
         TREE_SCAN_EXCLUDE=$(jq -r '.downstream.treeScanExclude | map(":!" + .) | join(" ")' "$CONFIG")
+
+        # Materialize the review checklist (optional array of markdown
+        # strings) to a sidecar file consumed by the PR body builder.
+        # Missing or null -> empty file -> the section is omitted.
+        jq -r '.downstream.reviewChecklist // [] | .[] | "- [ ] " + .' "$CONFIG" \
+          > /tmp/review-checklist.md
 
         {
           echo "UPSTREAM_OWNER=$UPSTREAM_OWNER"
@@ -289,6 +304,55 @@ runs:
       run: |
         git push --force-with-lease origin "${SYNC_BRANCH}"
 
+    - name: Resolve commit authors
+      if: steps.range.outputs.has_changes == 'true'
+      shell: bash
+      working-directory: target
+      env:
+        UPSTREAM_READ_TOKEN: ${{ inputs.upstream-read-token }}
+      run: |
+        # Look up each upstream commit's author login via the GitHub API,
+        # so the PR body can render `by [@user](https://github.com/user)`
+        # even when the commit author email is a personal address (not the
+        # `<id>+<login>@users.noreply.github.com` form). Without this, awk's
+        # email-parsing fallback only captures noreply commits.
+        #
+        # Token: caller passes the bot repo's GITHUB_TOKEN. Public-repo
+        # `/repos/{owner}/{repo}/commits/{sha}` works fine with it. For a
+        # private upstream, supply an installation token for that repo.
+        #
+        # Capped at 50 lookups to mirror the PR body's commit-list cap.
+        # Failures (rate limit, 404, no auth) downgrade silently — awk
+        # falls back to the noreply parse, then to the plain author name.
+
+        AUTHORS_FILE=/tmp/authors.tsv
+        : > "$AUTHORS_FILE"
+
+        if [ -z "${UPSTREAM_READ_TOKEN}" ]; then
+          echo "No upstream-read-token provided; skipping author resolution. PR body will use email-derived logins only."
+          exit 0
+        fi
+
+        BASE='${{ steps.base.outputs.base_sha }}'
+        HEAD='${{ steps.range.outputs.head_sha }}'
+
+        SHAS=$(git log --no-merges --pretty=format:"%H" "${BASE}..${HEAD}" | head -50)
+        RESOLVED=0
+        FAILED=0
+        for SHA in ${SHAS}; do
+          LOGIN=$(GH_TOKEN="${UPSTREAM_READ_TOKEN}" \
+            gh api "/repos/${UPSTREAM_REPO}/commits/${SHA}" \
+              --jq '.author.login // ""' 2>/dev/null || true)
+          if [ -n "${LOGIN}" ]; then
+            RESOLVED=$((RESOLVED + 1))
+          else
+            FAILED=$((FAILED + 1))
+          fi
+          printf '%s\t%s\n' "${SHA}" "${LOGIN}" >> "$AUTHORS_FILE"
+        done
+
+        echo "Resolved ${RESOLVED} author login(s); ${FAILED} fell back to email/name parsing."
+
     - name: Build PR body
       if: steps.range.outputs.has_changes == 'true'
       shell: bash
@@ -377,13 +441,20 @@ runs:
           echo ""
           git log --no-merges --pretty=format:"%H%x09%s%x09%an%x09%ae" "${BASE}..${HEAD}" \
             | head -50 \
-            | awk -F'\t' -v repo="${UPSTREAM_REPO}" '
+            | awk -F'\t' -v repo="${UPSTREAM_REPO}" -v authors_file="/tmp/authors.tsv" '
+                BEGIN {
+                  while ((getline line < authors_file) > 0) {
+                    n = split(line, parts, "\t")
+                    if (n >= 1) logins[parts[1]] = (n >= 2 ? parts[2] : "")
+                  }
+                  close(authors_file)
+                }
                 {
                   sha = $1; msg = $2; author_name = $3; email = $4
                   gsub(/\[/, "\\[", msg)
                   gsub(/\]/, "\\]", msg)
-                  user = ""
-                  if (email ~ /@users\.noreply\.github\.com$/) {
+                  user = logins[sha]
+                  if (length(user) == 0 && email ~ /@users\.noreply\.github\.com$/) {
                     user_part = email
                     sub(/@users\.noreply\.github\.com$/, "", user_part)
                     sub(/^[0-9]+\+/, "", user_part)
@@ -420,13 +491,12 @@ runs:
             echo "_…and $((TOTAL_FILES - 30)) more files. See the [compare view](${COMPARE_URL}) for the full diff._"
           fi
           echo ""
-          echo "## Review checklist before merging"
-          echo ""
-          echo "- [ ] **\`wrangler.toml\`** — if the upstream modified this file, make sure your local values for \`database_id\`, KV \`id\`, and any custom \`[env.*]\` sections are preserved (not overwritten with upstream placeholders)."
-          echo "- [ ] **\`migrations/\`** — any new SQL files will be applied automatically on the next \`npm run deploy\`. Confirm they are compatible with your D1 instance."
-          echo "- [ ] **Secrets / environment variables** — check whether the upstream introduced new required values (scan the diff for \`BOOTSTRAP_\`, \`SECRET\`, \`process.env.\`) and configure them in Cloudflare before deploying."
-          echo "- [ ] **Breaking changes** — scan the commit messages above for \`BREAKING CHANGE\`, major version bumps, or schema-affecting refactors."
-          echo ""
+          if [ -s /tmp/review-checklist.md ]; then
+            echo "## Review checklist before merging"
+            echo ""
+            cat /tmp/review-checklist.md
+            echo ""
+          fi
           echo "## How to handle this PR"
           echo ""
           echo "| Action | What to do |"
