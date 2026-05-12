@@ -23,9 +23,9 @@ inputs:
     description: |
       Token used to look up upstream commit metadata (author logins) for the
       PR body's "Incoming commits" section. Typically the workflow's
-      `${{ secrets.GITHUB_TOKEN }}` — it can read public-repo metadata
-      without further setup. If the upstream is private, supply an
-      installation token that has access to it instead.
+      secrets.GITHUB_TOKEN — it can read public-repo metadata without
+      further setup. If the upstream is private, supply an installation
+      token that has access to it instead.
     required: false
     default: ""
   config-path:
