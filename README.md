@@ -211,7 +211,7 @@ When the bot runs against your repo, it:
 3. Creates the PR or, if `chore/sync-upstream` already has a PR (open or closed), updates that PR's title and body in place.
 4. Tags the upstream commit it synced against as `upstream-sync-base` in your repo, so the next run knows where to pick up.
 
-Conflicts: if `git apply --3way` or `git merge` produce conflict markers, the bot still pushes the branch and opens the PR, but the body lists which files need manual resolution. Resolve them on `chore/sync-upstream` and the workflow will pick up the resolved tree on the next run.
+Conflicts: if `git apply --3way` or `git merge` produce conflict markers, or if a snapshot-clone patch cannot be fully applied and leaves `.rej` files, the bot still pushes the branch and opens the PR. The PR body lists which files need manual resolution. Resolve them on `chore/sync-upstream` and the workflow will pick up the resolved tree on the next run.
 
 ---
 

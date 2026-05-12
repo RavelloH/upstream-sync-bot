@@ -289,19 +289,54 @@ runs:
             exit 0
           fi
 
+          APPLY_LOG="$(mktemp)"
           APPLY_RC=0
-          git apply --3way --whitespace=nowarn "${PATCH_FILE}" || APPLY_RC=$?
-          git add -A
+          git apply --3way --whitespace=nowarn "${PATCH_FILE}" > "${APPLY_LOG}" 2>&1 || APPLY_RC=$?
 
-          CONFLICT_FILES="$(git grep --cached -l -E '^<<<<<<< ' -- . 2>/dev/null || true)"
-          if [ -n "${CONFLICT_FILES}" ]; then
+          CONFLICT_FILES="$(git grep -l -E '^<<<<<<< ' -- . 2>/dev/null || true)"
+
+          if [ "${APPLY_RC}" != "0" ] && [ -z "${CONFLICT_FILES}" ]; then
+            echo "git apply --3way could not fully apply the patch without conflict markers. Retrying with --reject so the PR can carry manual-resolution hints."
+            git reset --hard "origin/${DEFAULT_BRANCH}"
+            REJECT_LOG="$(mktemp)"
+            REJECT_RC=0
+            git apply --reject --whitespace=nowarn "${PATCH_FILE}" > "${REJECT_LOG}" 2>&1 || REJECT_RC=$?
+
+            mkdir -p .upstream-sync
+            {
+              echo "# Upstream sync patch could not be fully applied"
+              echo ""
+              echo "The bot could not apply every hunk automatically. Files ending in \`.rej\` contain rejected hunks that must be merged manually before this PR is merged."
+              echo ""
+              echo "## git apply --3way output"
+              echo ""
+              echo '```text'
+              cat "${APPLY_LOG}"
+              echo '```'
+              echo ""
+              echo "## git apply --reject output"
+              echo ""
+              echo '```text'
+              cat "${REJECT_LOG}"
+              echo '```'
+            } > .upstream-sync/apply-failure.md
+
+            REJECT_FILES="$(find . -name '*.rej' -print | sed 's#^\./##' | sort || true)"
+            if [ -n "${REJECT_FILES}" ]; then
+              CONFLICT_FILES="${REJECT_FILES}"
+            else
+              CONFLICT_FILES=".upstream-sync/apply-failure.md"
+            fi
+            HAS_CONFLICTS=true
+
+            if [ "${REJECT_RC}" != "0" ]; then
+              echo "git apply --reject exited ${REJECT_RC}; preserving logs in .upstream-sync/apply-failure.md."
+            fi
+          elif [ -n "${CONFLICT_FILES}" ]; then
             HAS_CONFLICTS=true
           fi
 
-          if [ "${APPLY_RC}" != "0" ] && [ "${HAS_CONFLICTS}" = "false" ]; then
-            echo "::error::git apply exited ${APPLY_RC} but no conflict markers were produced. Patch likely could not be applied at all. Aborting."
-            exit 1
-          fi
+          git add -A
 
           SQUASH_BODY="Squashes ${COUNT} upstream commit(s) from ${BASE_SHA:0:7}..${HEAD_SHORT}.
 
@@ -311,9 +346,9 @@ runs:
             SQUASH_TITLE="chore: sync upstream ${UPSTREAM_REPO}@${HEAD_SHORT} (with conflicts)"
             SQUASH_BODY="${SQUASH_BODY}
 
-        ⚠️ Conflicts in: $(echo "${CONFLICT_FILES}" | tr '\n' ' ')
+        ⚠️ Manual resolution required in: $(echo "${CONFLICT_FILES}" | tr '\n' ' ')
 
-        Resolve the <<<<<<< markers manually before merging this PR."
+        Resolve conflict markers and/or apply rejected hunks from any .rej files before merging this PR."
           else
             SQUASH_TITLE="chore: sync upstream ${UPSTREAM_REPO}@${HEAD_SHORT}"
           fi
@@ -452,7 +487,7 @@ runs:
           if [ "${HAS_CONFLICTS}" = "true" ]; then
             echo "## ⚠️ Conflicts detected"
             echo ""
-            echo "Some files could not be merged automatically. The following files contain \`<<<<<<<\` / \`=======\` / \`>>>>>>>\` markers and **must be resolved before merging**:"
+            echo "Some files could not be merged automatically. The following files contain conflict markers, rejected patch hunks, or apply-failure details and **must be resolved before merging**:"
             echo ""
             while IFS= read -r f; do
               [ -z "$f" ] && continue
@@ -464,7 +499,7 @@ runs:
             echo "\`\`\`bash"
             echo "git fetch origin ${SYNC_BRANCH}"
             echo "git checkout ${SYNC_BRANCH}"
-            echo "# edit the files above, remove conflict markers"
+            echo "# edit the files above, remove conflict markers, and apply any *.rej hunks"
             echo "git add -A && git commit --amend --no-edit"
             echo "git push --force-with-lease"
             echo "\`\`\`"
