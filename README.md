@@ -213,6 +213,8 @@ When the bot runs against your repo, it:
 
 Conflicts: if `git apply --3way` or `git merge` produce conflict markers, or if a snapshot-clone patch cannot be fully applied and leaves `.rej` files, the bot still pushes the branch and opens the PR. The PR body lists which files need manual resolution. Resolve them on `chore/sync-upstream` and the workflow will pick up the resolved tree on the next run.
 
+Workflow files: changes under `.github/workflows/` are intentionally excluded from the pushed sync branch because updating workflow files requires the GitHub App's `workflows` permission. The bot does not request that permission by default. If upstream changed workflow files, the PR body links to the files and asks you to copy them manually after review.
+
 ---
 
 ## Files in this template

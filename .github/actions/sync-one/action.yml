@@ -256,6 +256,13 @@ runs:
 
         HAS_CONFLICTS=false
         CONFLICT_FILES=""
+        MANUAL_WORKFLOW_FILES="$(git diff --name-only "${BASE_SHA}" "${HEAD_SHA}" -- '.github/workflows/**' || true)"
+        if [ -n "${MANUAL_WORKFLOW_FILES}" ]; then
+          echo "Workflow file changes detected. They will be excluded from the bot commit because this App does not request workflows permission."
+          printf '%s\n' "${MANUAL_WORKFLOW_FILES}" > /tmp/manual-workflow-files.txt
+        else
+          : > /tmp/manual-workflow-files.txt
+        fi
 
         if [ "${MODE}" = "merge" ]; then
           # Fork / clean clone — preserve upstream commit history via
@@ -275,65 +282,78 @@ runs:
 
         Resolve the <<<<<<< markers manually before merging this PR."
           fi
+
+          if [ -n "${MANUAL_WORKFLOW_FILES}" ]; then
+            while IFS= read -r f; do
+              [ -z "$f" ] && continue
+              git checkout "origin/${DEFAULT_BRANCH}" -- "$f" 2>/dev/null || git rm -f --ignore-unmatch "$f"
+            done < /tmp/manual-workflow-files.txt
+            git add -A -- .github/workflows
+            git commit --amend --no-edit --allow-empty
+          fi
         else
           # Snapshot clone — no shared history. Apply BASE..HEAD as a
           # single squash commit using `git apply --3way`. Avoids pulling
           # the entire upstream history into a one-commit repo.
           PATCH_FILE="$(mktemp)"
-          git diff --binary "${BASE_SHA}" "${HEAD_SHA}" > "${PATCH_FILE}"
+          git diff --binary "${BASE_SHA}" "${HEAD_SHA}" -- . ':(exclude).github/workflows/**' > "${PATCH_FILE}"
 
-          if [ ! -s "${PATCH_FILE}" ]; then
+          if [ ! -s "${PATCH_FILE}" ] && [ ! -s /tmp/manual-workflow-files.txt ]; then
             echo "Empty patch produced. Treating as no-op."
             echo "skip=true" >> "$GITHUB_OUTPUT"
             echo "has_conflicts=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          APPLY_LOG="$(mktemp)"
-          APPLY_RC=0
-          git apply --3way --whitespace=nowarn "${PATCH_FILE}" > "${APPLY_LOG}" 2>&1 || APPLY_RC=$?
+          if [ -s "${PATCH_FILE}" ]; then
+            APPLY_LOG="$(mktemp)"
+            APPLY_RC=0
+            git apply --3way --whitespace=nowarn "${PATCH_FILE}" > "${APPLY_LOG}" 2>&1 || APPLY_RC=$?
 
-          CONFLICT_FILES="$(git grep -l -E '^<<<<<<< ' -- . 2>/dev/null || true)"
+            CONFLICT_FILES="$(git grep -l -E '^<<<<<<< ' -- . 2>/dev/null || true)"
 
-          if [ "${APPLY_RC}" != "0" ] && [ -z "${CONFLICT_FILES}" ]; then
-            echo "git apply --3way could not fully apply the patch without conflict markers. Retrying with --reject so the PR can carry manual-resolution hints."
-            git reset --hard "origin/${DEFAULT_BRANCH}"
-            REJECT_LOG="$(mktemp)"
-            REJECT_RC=0
-            git apply --reject --whitespace=nowarn "${PATCH_FILE}" > "${REJECT_LOG}" 2>&1 || REJECT_RC=$?
+            if [ "${APPLY_RC}" != "0" ] && [ -z "${CONFLICT_FILES}" ]; then
+              echo "git apply --3way could not fully apply the patch without conflict markers. Retrying with --reject so the PR can carry manual-resolution hints."
+              git reset --hard "origin/${DEFAULT_BRANCH}"
+              REJECT_LOG="$(mktemp)"
+              REJECT_RC=0
+              git apply --reject --whitespace=nowarn "${PATCH_FILE}" > "${REJECT_LOG}" 2>&1 || REJECT_RC=$?
 
-            mkdir -p .upstream-sync
-            {
-              echo "# Upstream sync patch could not be fully applied"
-              echo ""
-              echo "The bot could not apply every hunk automatically. Files ending in \`.rej\` contain rejected hunks that must be merged manually before this PR is merged."
-              echo ""
-              echo "## git apply --3way output"
-              echo ""
-              echo '```text'
-              cat "${APPLY_LOG}"
-              echo '```'
-              echo ""
-              echo "## git apply --reject output"
-              echo ""
-              echo '```text'
-              cat "${REJECT_LOG}"
-              echo '```'
-            } > .upstream-sync/apply-failure.md
+              mkdir -p .upstream-sync
+              {
+                echo "# Upstream sync patch could not be fully applied"
+                echo ""
+                echo "The bot could not apply every hunk automatically. Files ending in \`.rej\` contain rejected hunks that must be merged manually before this PR is merged."
+                echo ""
+                echo "## git apply --3way output"
+                echo ""
+                echo '```text'
+                cat "${APPLY_LOG}"
+                echo '```'
+                echo ""
+                echo "## git apply --reject output"
+                echo ""
+                echo '```text'
+                cat "${REJECT_LOG}"
+                echo '```'
+              } > .upstream-sync/apply-failure.md
 
-            REJECT_FILES="$(find . -name '*.rej' -print | sed 's#^\./##' | sort || true)"
-            if [ -n "${REJECT_FILES}" ]; then
-              CONFLICT_FILES="${REJECT_FILES}"
-            else
-              CONFLICT_FILES=".upstream-sync/apply-failure.md"
+              REJECT_FILES="$(find . -name '*.rej' -print | sed 's#^\./##' | sort || true)"
+              if [ -n "${REJECT_FILES}" ]; then
+                CONFLICT_FILES="${REJECT_FILES}"
+              else
+                CONFLICT_FILES=".upstream-sync/apply-failure.md"
+              fi
+              HAS_CONFLICTS=true
+
+              if [ "${REJECT_RC}" != "0" ]; then
+                echo "git apply --reject exited ${REJECT_RC}; preserving logs in .upstream-sync/apply-failure.md."
+              fi
+            elif [ -n "${CONFLICT_FILES}" ]; then
+              HAS_CONFLICTS=true
             fi
-            HAS_CONFLICTS=true
-
-            if [ "${REJECT_RC}" != "0" ]; then
-              echo "git apply --reject exited ${REJECT_RC}; preserving logs in .upstream-sync/apply-failure.md."
-            fi
-          elif [ -n "${CONFLICT_FILES}" ]; then
-            HAS_CONFLICTS=true
+          else
+            echo "Only workflow files changed upstream. Creating an empty sync commit so the PR can carry manual-copy instructions."
           fi
 
           git add -A
@@ -444,7 +464,7 @@ runs:
         WORKFLOW_URL="${BOT_SERVER_URL}/${BOT_REPOSITORY}/blob/HEAD/.github/workflows/sync-fanout.yml"
 
         TOTAL_COMMITS="$(git rev-list --count --no-merges "${BASE}..${HEAD}")"
-        TOTAL_FILES="$(git diff --name-only "${BASE}..${HEAD}" | wc -l | tr -d ' ')"
+        TOTAL_FILES="$(git diff --name-only "${BASE}..${HEAD}" -- . ':(exclude).github/workflows/**' | wc -l | tr -d ' ')"
 
         case "${BASE_RESOLVED_FROM}" in
           merge-base) BASE_NOTE="via shared git history (\`git merge-base\`)" ;;
@@ -483,6 +503,18 @@ runs:
           echo ""
           echo "> ℹ️ ${MODE_NOTE}"
           echo ""
+
+          if [ -s /tmp/manual-workflow-files.txt ]; then
+            echo "## ⚠️ Workflow files require manual copy"
+            echo ""
+            echo "The upstream changed GitHub Actions workflow files. This bot intentionally does not request the \`workflows\` permission, so those files are excluded from the pushed sync branch. Review and copy these files manually from upstream if you want the workflow changes:"
+            echo ""
+            while IFS= read -r f; do
+              [ -z "$f" ] && continue
+              echo "- [\`${f}\`](https://github.com/${UPSTREAM_REPO}/blob/${HEAD}/${f})"
+            done < /tmp/manual-workflow-files.txt
+            echo ""
+          fi
 
           if [ "${HAS_CONFLICTS}" = "true" ]; then
             echo "## ⚠️ Conflicts detected"
@@ -560,7 +592,7 @@ runs:
           echo ""
           echo "## Files changed"
           echo ""
-          git diff --name-status "${BASE}..${HEAD}" | head -30 | awk -v repo="${UPSTREAM_REPO}" '{
+          git diff --name-status "${BASE}..${HEAD}" -- . ':(exclude).github/workflows/**' | head -30 | awk -v repo="${UPSTREAM_REPO}" '{
             status = $1;
             path = $2;
             label = "changed";
