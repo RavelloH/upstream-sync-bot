@@ -3,7 +3,10 @@
   "upstream": {
     "owner": "RavelloH",
     "repo": "upstream-sync-bot",
-    "branch": "main"
+    "branch": "main",
+    "syncTarget": {
+      "type": "branch"
+    }
   },
   "downstream": {
     "syncBranch": "chore/sync-upstream",

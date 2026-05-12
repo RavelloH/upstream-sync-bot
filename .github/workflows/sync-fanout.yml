@@ -32,12 +32,12 @@ jobs:
       count: ${{ steps.list.outputs.count }}
     steps:
       - name: Checkout bot repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
-          node-version: '20'
+          node-version: '24'
           cache: npm
 
       - name: Install deps
@@ -82,7 +82,7 @@ jobs:
       - name: Checkout bot repo
         # Needed so the composite action at `.github/actions/sync-one`
         # is on disk for `uses: ./...` to resolve.
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Mint installation token
         uses: actions/create-github-app-token@v1

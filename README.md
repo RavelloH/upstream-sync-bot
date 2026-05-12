@@ -102,7 +102,10 @@ Edit [`sync-bot.config.json`](./sync-bot.config.json):
   "upstream": {
     "owner": "YourOrg",
     "repo": "YourProject",
-    "branch": "main"
+    "branch": "main",
+    "syncTarget": {
+      "type": "branch"
+    }
   },
   "downstream": {
     "syncBranch": "chore/sync-upstream",
@@ -114,6 +117,14 @@ Edit [`sync-bot.config.json`](./sync-bot.config.json):
 ```
 
 `treeScanExclude` lists files to ignore when matching a snapshot-clone's tree against upstream history (typically per-deployment config that diverges immediately — e.g., `wrangler.toml`, `.env.example`).
+
+`upstream.syncTarget` controls which upstream commit the bot syncs to:
+
+| Config | Behavior |
+| --- | --- |
+| `{ "type": "branch" }` | Keep the current behavior: sync to the latest commit on `upstream.branch`. |
+| `{ "type": "latestTag" }` | Sync to the commit pointed to by the latest stable SemVer tag, allowing major-version jumps. Tags can be `v1.2.3` or `1.2.3`; prerelease tags are ignored. |
+| `{ "type": "latestMajorTag", "major": 1 }` | Sync to the latest stable SemVer tag in the selected major version, such as the newest `v1.x.x` tag. |
 
 ### 5. Adjust the cron schedule (optional)
 
@@ -212,6 +223,7 @@ Conflicts: if `git apply --3way` or `git merge` produce conflict markers, the bo
 | `.github/workflows/sync-fanout.yml` | The schedule + dispatch trigger, enumerate job, and matrix fan-out. |
 | `.github/actions/sync-one/action.yml` | Composite action with all per-target sync logic (mode detection, patch application, PR body). |
 | `scripts/enumerate-installations.mjs` | Lists installations + repos via `@octokit/auth-app`, filters self/upstream, emits matrix JSON. |
+| `scripts/select-sync-target.mjs` | Resolves `upstream.syncTarget` to a branch commit or latest matching SemVer tag commit. |
 | `package.json` | Just two deps: `@octokit/auth-app`, `@octokit/request`. |
 
 ---

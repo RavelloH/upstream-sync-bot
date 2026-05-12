@@ -50,6 +50,8 @@ runs:
         UPSTREAM_OWNER=$(jq -r '.upstream.owner' "$CONFIG")
         UPSTREAM_REPO_NAME=$(jq -r '.upstream.repo' "$CONFIG")
         UPSTREAM_BRANCH=$(jq -r '.upstream.branch' "$CONFIG")
+        SYNC_TARGET_TYPE=$(jq -r '.upstream.syncTarget.type // "branch"' "$CONFIG")
+        SYNC_TARGET_MAJOR=$(jq -r '.upstream.syncTarget.major // ""' "$CONFIG")
         SYNC_BRANCH=$(jq -r '.downstream.syncBranch' "$CONFIG")
         BASE_TAG=$(jq -r '.downstream.baseTag' "$CONFIG")
         PR_TITLE=$(jq -r '.downstream.prTitle' "$CONFIG")
@@ -66,6 +68,8 @@ runs:
           echo "UPSTREAM_REPO_NAME=$UPSTREAM_REPO_NAME"
           echo "UPSTREAM_REPO=$UPSTREAM_OWNER/$UPSTREAM_REPO_NAME"
           echo "UPSTREAM_BRANCH=$UPSTREAM_BRANCH"
+          echo "SYNC_TARGET_TYPE=$SYNC_TARGET_TYPE"
+          echo "SYNC_TARGET_MAJOR=$SYNC_TARGET_MAJOR"
           echo "SYNC_BRANCH=$SYNC_BRANCH"
           echo "BASE_TAG=$BASE_TAG"
           echo "PR_TITLE=$PR_TITLE"
@@ -107,9 +111,35 @@ runs:
       run: |
         git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
         git fetch upstream "${UPSTREAM_BRANCH}" --no-recurse-submodules
+        if [ "${SYNC_TARGET_TYPE}" = "latestTag" ] || [ "${SYNC_TARGET_TYPE}" = "latestMajorTag" ]; then
+          git fetch upstream "refs/tags/*:refs/tags/*" --no-recurse-submodules
+        fi
         # Fetch the base-tracking tag if it exists from a previous run.
         # 2>/dev/null hides "no such ref" on first sync of a new target.
         git fetch origin "refs/tags/${BASE_TAG}:refs/tags/${BASE_TAG}" 2>/dev/null || true
+
+    - name: Resolve upstream sync target
+      shell: bash
+      working-directory: target
+      run: |
+        eval "$(node "${GITHUB_WORKSPACE}/scripts/select-sync-target.mjs" \
+          "${SYNC_TARGET_TYPE}" \
+          "${SYNC_TARGET_MAJOR}" \
+          "upstream/${UPSTREAM_BRANCH}")"
+
+        {
+          echo "SYNC_TARGET_SHA=${TARGET_SHA}"
+          echo "SYNC_TARGET_SHORT=${TARGET_SHA:0:7}"
+          echo "SYNC_TARGET_REF=${TARGET_REF}"
+          echo "SYNC_TARGET_KIND=${TARGET_KIND}"
+          echo "SYNC_TARGET_TAG=${TARGET_TAG}"
+        } >> "$GITHUB_ENV"
+
+        if [ -n "${TARGET_TAG}" ]; then
+          echo "Resolved upstream sync target: ${TARGET_TAG} (${TARGET_SHA:0:7})."
+        else
+          echo "Resolved upstream sync target: ${TARGET_REF} (${TARGET_SHA:0:7})."
+        fi
 
     - name: Detect sync mode and base
       id: base
@@ -135,7 +165,7 @@ runs:
         #              `git apply --3way`. Avoids dumping all of upstream's
         #              history into a snapshot-clone repository.
 
-        MERGE_BASE="$(git merge-base "origin/${DEFAULT_BRANCH}" "upstream/${UPSTREAM_BRANCH}" 2>/dev/null || true)"
+        MERGE_BASE="$(git merge-base "origin/${DEFAULT_BRANCH}" "${SYNC_TARGET_SHA}" 2>/dev/null || true)"
 
         if [ -n "${MERGE_BASE}" ]; then
           MODE=merge
@@ -151,7 +181,7 @@ runs:
           else
             echo "Snapshot clone detected and no \`${BASE_TAG}\` tag. Scanning upstream for a matching tree..."
             BASE_SHA=""
-            for sha in $(git rev-list "upstream/${UPSTREAM_BRANCH}" --max-count=1000); do
+            for sha in $(git rev-list "${SYNC_TARGET_SHA}" --max-count=1000); do
               # shellcheck disable=SC2086
               if git diff --quiet HEAD "$sha" -- . ${TREE_SCAN_EXCLUDE}; then
                 BASE_SHA="$sha"
@@ -183,7 +213,7 @@ runs:
         DEFAULT_BRANCH='${{ steps.base.outputs.default_branch }}'
         BASE_SHA='${{ steps.base.outputs.base_sha }}'
         MODE='${{ steps.base.outputs.mode }}'
-        HEAD_SHA="$(git rev-parse "upstream/${UPSTREAM_BRANCH}")"
+        HEAD_SHA="${SYNC_TARGET_SHA}"
 
         echo "default_branch=${DEFAULT_BRANCH}" >> "$GITHUB_OUTPUT"
 
@@ -194,7 +224,7 @@ runs:
         fi
 
         if [ "$MODE" = "merge" ] && git merge-base --is-ancestor "$HEAD_SHA" "origin/${DEFAULT_BRANCH}"; then
-          echo "Upstream HEAD is already an ancestor of origin/${DEFAULT_BRANCH}. Nothing to do."
+          echo "Upstream sync target is already an ancestor of origin/${DEFAULT_BRANCH}. Nothing to do."
           echo "has_changes=false" >> "$GITHUB_OUTPUT"
           exit 0
         fi
@@ -229,13 +259,13 @@ runs:
 
         if [ "${MODE}" = "merge" ]; then
           # Fork / clean clone — preserve upstream commit history via
-          # a real merge commit. Two parents: origin/<default> and
-          # upstream/<branch>.
+          # a real merge commit. Two parents: origin/<default> and the
+          # resolved upstream sync target.
           MERGE_TITLE="chore: sync upstream ${UPSTREAM_REPO}@${HEAD_SHORT}"
           MERGE_BODY="$(printf 'Merges %s upstream commit(s) from %s..%s into %s.\n\nAuto-merged by sync-upstream bot (run #%s).' \
             "${COUNT}" "${BASE_SHA:0:7}" "${HEAD_SHORT}" "${DEFAULT_BRANCH}" "${RUN_ID}")"
 
-          if ! git merge --no-ff "upstream/${UPSTREAM_BRANCH}" -m "${MERGE_TITLE}" -m "${MERGE_BODY}"; then
+          if ! git merge --no-ff "${HEAD_SHA}" -m "${MERGE_TITLE}" -m "${MERGE_BODY}"; then
             CONFLICT_FILES="$(git diff --name-only --diff-filter=U)"
             HAS_CONFLICTS=true
             git add -A
@@ -250,7 +280,7 @@ runs:
           # single squash commit using `git apply --3way`. Avoids pulling
           # the entire upstream history into a one-commit repo.
           PATCH_FILE="$(mktemp)"
-          git diff --binary "${BASE_SHA}" "upstream/${UPSTREAM_BRANCH}" > "${PATCH_FILE}"
+          git diff --binary "${BASE_SHA}" "${HEAD_SHA}" > "${PATCH_FILE}"
 
           if [ ! -s "${PATCH_FILE}" ]; then
             echo "Empty patch produced. Treating as no-op."
@@ -394,8 +424,27 @@ runs:
           MODE_NOTE="This repository has no shared git history with the upstream (e.g., created via Cloudflare's *Deploy to Cloudflare* button, which produces a single snapshot commit). The changes are applied as a single **squashed commit** via \`git apply --3way\` to avoid pulling all of upstream's history into a one-commit repository. Per-commit authorship is preserved below in the *Incoming commits* section."
         fi
 
+        case "${SYNC_TARGET_KIND}" in
+          branch)
+            TARGET_NOTE="the latest commit on \`${UPSTREAM_BRANCH}\`"
+            TARGET_ROW="\`${UPSTREAM_BRANCH}\` branch"
+            ;;
+          latestTag)
+            TARGET_NOTE="the latest stable SemVer tag \`${SYNC_TARGET_TAG}\`"
+            TARGET_ROW="latest stable SemVer tag \`${SYNC_TARGET_TAG}\`"
+            ;;
+          latestMajorTag)
+            TARGET_NOTE="the latest stable SemVer tag in major \`${SYNC_TARGET_MAJOR}\`: \`${SYNC_TARGET_TAG}\`"
+            TARGET_ROW="latest stable SemVer tag in major \`${SYNC_TARGET_MAJOR}\`: \`${SYNC_TARGET_TAG}\`"
+            ;;
+          *)
+            TARGET_NOTE="\`${SYNC_TARGET_REF}\`"
+            TARGET_ROW="\`${SYNC_TARGET_REF}\`"
+            ;;
+        esac
+
         {
-          echo "This pull request is automatically maintained by the [\`${BOT_REPOSITORY}\`](${BOT_SERVER_URL}/${BOT_REPOSITORY}) sync bot (see [\`sync-fanout.yml\`](${WORKFLOW_URL})). It pulls the latest changes from the upstream repository [\`${UPSTREAM_REPO}\`](https://github.com/${UPSTREAM_REPO}) (\`${UPSTREAM_BRANCH}\` branch) into this repository so that your deployment stays in sync."
+          echo "This pull request is automatically maintained by the [\`${BOT_REPOSITORY}\`](${BOT_SERVER_URL}/${BOT_REPOSITORY}) sync bot (see [\`sync-fanout.yml\`](${WORKFLOW_URL})). It pulls ${TARGET_NOTE} from the upstream repository [\`${UPSTREAM_REPO}\`](https://github.com/${UPSTREAM_REPO}) into this repository so that your deployment stays in sync."
           echo ""
           echo "> ℹ️ ${MODE_NOTE}"
           echo ""
@@ -428,9 +477,10 @@ runs:
           echo "| --- | --- |"
           echo "| Upstream repository | [\`${UPSTREAM_REPO}\`](https://github.com/${UPSTREAM_REPO}) |"
           echo "| Upstream branch | \`${UPSTREAM_BRANCH}\` |"
+          echo "| Sync target | ${TARGET_ROW} |"
           echo "| Sync mode | \`${MODE}\` (${BASE_NOTE}) |"
           echo "| Base (upstream commit at deploy/last sync) | [\`${BASE_SHORT}\`](https://github.com/${UPSTREAM_REPO}/commit/${BASE}) |"
-          echo "| Head (upstream \`${UPSTREAM_BRANCH}\`) | [\`${HEAD_SHORT}\`](https://github.com/${UPSTREAM_REPO}/commit/${HEAD}) |"
+          echo "| Target commit | [\`${HEAD_SHORT}\`](https://github.com/${UPSTREAM_REPO}/commit/${HEAD}) |"
           echo "| New commits | **${COUNT}** |"
           echo "| Files changed | **${TOTAL_FILES}** |"
           echo "| Last synced at | \`${NOW}\` |"
