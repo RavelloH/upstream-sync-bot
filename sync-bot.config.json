@@ -2,19 +2,17 @@
   "$schema": "./sync-bot.config.schema.json",
   "upstream": {
     "owner": "RavelloH",
-    "repo": "InsightFlare",
+    "repo": "upstream-sync-bot",
     "branch": "main"
   },
   "downstream": {
     "syncBranch": "chore/sync-upstream",
     "baseTag": "upstream-sync-base",
-    "prTitle": "chore: sync upstream RavelloH/InsightFlare",
-    "treeScanExclude": ["wrangler.toml"],
+    "prTitle": "chore: sync upstream RavelloH/upstream-sync-bot",
+    "treeScanExclude": ["sync-bot.config.json"],
     "reviewChecklist": [
-      "**`wrangler.toml`** — if the upstream modified this file, make sure your local values for `database_id`, KV `id`, and any custom `[env.*]` sections are preserved (not overwritten with upstream placeholders).",
-      "**`migrations/`** — any new SQL files will be applied automatically on the next `npm run deploy`. Confirm they are compatible with your D1 instance.",
-      "**Secrets / environment variables** — check whether the upstream introduced new required values (scan the diff for `BOOTSTRAP_`, `SECRET`, `process.env.`) and configure them in Cloudflare before deploying.",
-      "**Breaking changes** — scan the commit messages above for `BREAKING CHANGE`, major version bumps, or schema-affecting refactors."
+      "**`sync-bot.config.json`** — This file is used to configure the sync bot. Please verify that upstream changes have not overwritten your version of this file.",
+      "**`.github/workflows/sync-fanout.yml`** — If you have modified the default runtime, please verify that upstream changes have not overwritten your version of this file."
     ]
   },
   "maxParallel": 16,

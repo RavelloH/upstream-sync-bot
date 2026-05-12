@@ -6,6 +6,8 @@ Template GitHub repository for running a **"sync from upstream → fan out to ev
 
 Downstream users install the App once. After that they receive automated pull requests with upstream changes — no PAT, no `.github/workflows/`, no settings toggles, no scripts to run.
 
+This repository is meant to be copied once per upstream project by the upstream maintainer. The copied bot repository owns the GitHub Actions schedule, stores the GitHub App credentials as Actions secrets, enumerates every repository where the App is installed, and opens or updates one sync PR per downstream repository.
+
 ---
 
 ## How it works
@@ -44,6 +46,14 @@ Downstream users install the App once. After that they receive automated pull re
 ```
 
 The bot stores **no state**. Every run re-queries GitHub for the live installation list, and each target repo carries its own `upstream-sync-base` tag and `chore/sync-upstream` branch as the cursor.
+
+---
+
+## Keeping your bot instance updated
+
+If you created your own bot repository from this template, you can receive updates from this upstream template by installing [**upstream-sync-bot Sync**](https://github.com/apps/upstream-sync-bot-sync) on your bot instance repository.
+
+When GitHub asks where to install the App, choose **Only select repositories** and select only your `upstream-sync-bot` instance repository. Do not install it on **All repositories**; this App is only meant to keep bot instances synchronized with this template.
 
 ---
 
@@ -146,6 +156,11 @@ In your upstream project's README, add a section pointing at the App install URL
 
 After installing, you'll automatically receive pull requests with upstream
 changes — no further setup required.
+
+When GitHub asks where to install the App, choose **Only select repositories**
+and select only the fork or deployment repository that should receive sync PRs.
+Do not install it on **All repositories** unless every repository in the account
+is meant to be managed by this sync bot.
 ```
 
 The slug is whatever you typed as "GitHub App name" in step 1, lowercased with spaces replaced by `-`. You can confirm it at <https://github.com/settings/apps>.
@@ -164,7 +179,9 @@ If `enumerate` fails with `Bad credentials`, double-check `SYNC_APP_PRIVATE_KEY`
 
 ## For downstream users
 
-If you forked or cloned a project that ships with this bot, all you do is click the install link in that project's README, choose your fork, and click **Install**.
+If you forked or cloned a project that ships with this bot, install the paired GitHub App, choose the repository that should receive updates, and click **Install**.
+
+When GitHub asks for repository access, choose **Only select repositories** and select only the fork or deployment repository that needs upstream sync PRs. Do not choose **All repositories** unless you intentionally want this bot to manage every repository in that account.
 
 You can review what the App can do, restrict it to specific repos, or uninstall at any time under your account's **Settings → Integrations → Applications**.
 
@@ -210,4 +227,8 @@ Conflicts: if `git apply --3way` or `git merge` produce conflict markers, the bo
 
 ## License
 
-Licensed under the [MIT License](./LICENSE). Forks and bot instances generated from this template inherit MIT unless you replace the `LICENSE` file with something else.
+This template is licensed under the [MIT License](./LICENSE).
+
+MIT allows recipients to use, copy, modify, publish, distribute, sublicense, and sell copies of this template, including bot instances generated from it. The condition is that the original copyright notice and MIT permission notice must be included in all copies or substantial portions of the software.
+
+In other words, you may choose a different license for your own changes or for a larger project that incorporates this bot, but you should not present the original template code as if it were no longer MIT-licensed. If you redistribute a bot instance based on this template, keep the original MIT notice somewhere appropriate, such as `LICENSE`, `NOTICE`, or your documentation.
