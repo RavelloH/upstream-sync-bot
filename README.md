@@ -33,7 +33,6 @@ This repository is meant to be copied once per upstream project by the upstream 
 │  │     - detect mode (merge / adopt-history)    │  │
 │  │     - apply changes                          │  │
 │  │     - open or update PR                      │  │
-│  │     - move `upstream-sync-base` tag          │  │
 │  └──────────────────────────────────────────────┘  │
 └────────────────────────────────────────────────────┘
                   │ App installation token (1h, scoped)
@@ -45,7 +44,7 @@ This repository is meant to be copied once per upstream project by the upstream 
         └─────────────────────┘
 ```
 
-The bot stores **no state**. Every run re-queries GitHub for the live installation list, and each target repo carries its own `upstream-sync-base` tag and `chore/sync-upstream` branch as the cursor.
+The bot stores **no state**. Every run re-queries GitHub for the live installation list. Repositories with shared history use `git merge-base`; snapshot clones use a tree scan to find the upstream version represented by the current downstream tree before adopting upstream history.
 
 ---
 
@@ -109,7 +108,6 @@ Edit [`sync-bot.config.json`](./sync-bot.config.json):
   },
   "downstream": {
     "syncBranch": "chore/sync-upstream",
-    "baseTag": "upstream-sync-base",
     "prTitle": "chore: sync upstream YourOrg/YourProject",
     "treeScanExclude": ["wrangler.toml"]
   }
@@ -209,7 +207,6 @@ When the bot runs against your repo, it:
    - **`adopt-history` mode** — snapshot clone (no shared history, e.g., Cloudflare "Deploy to" button output). The bot rebuilds the sync branch on top of upstream history, then reapplies downstream customizations as one commit. After that PR is merged, future syncs can use regular merge mode.
 2. Force-pushes the result to `chore/sync-upstream`.
 3. Creates the PR or, if `chore/sync-upstream` already has a PR (open or closed), updates that PR's title and body in place.
-4. If the sync applied cleanly, tags the upstream commit it synced against as `upstream-sync-base` in your repo, so the next run knows where to pick up. Conflict PRs do not advance this tag because the target repo has not accepted that upstream tree yet.
 
 Conflicts: if `git merge` or the adopt-history customization commit produces conflict markers, the bot still pushes the branch and opens the PR. The PR body lists which files need manual resolution. Resolve them on `chore/sync-upstream` and the workflow will pick up the resolved tree on the next run.
 
@@ -221,7 +218,7 @@ Workflow files: changes under `.github/workflows/` are intentionally excluded fr
 
 | Path | Purpose |
 | --- | --- |
-| `sync-bot.config.json` | Per-instance config: upstream coordinates + downstream branch / tag names. **Edit this.** |
+| `sync-bot.config.json` | Per-instance config: upstream coordinates + downstream branch / PR settings. **Edit this.** |
 | `.github/workflows/sync-fanout.yml` | The schedule + dispatch trigger, enumerate job, and matrix fan-out. |
 | `.github/actions/sync-one/action.yml` | Composite action with all per-target sync logic (mode detection, patch application, PR body). |
 | `scripts/enumerate-installations.mjs` | Lists installations + repos via `@octokit/auth-app`, filters self/upstream, emits matrix JSON. |

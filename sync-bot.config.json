@@ -10,7 +10,6 @@
   },
   "downstream": {
     "syncBranch": "chore/sync-upstream",
-    "baseTag": "upstream-sync-base",
     "prTitle": "chore: sync upstream RavelloH/upstream-sync-bot",
     "treeScanExclude": ["sync-bot.config.json"],
     "reviewChecklist": [
