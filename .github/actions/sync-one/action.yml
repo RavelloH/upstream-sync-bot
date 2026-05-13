@@ -292,10 +292,17 @@ runs:
             git commit --amend --no-edit --allow-empty
           fi
         else
-          # Snapshot clone — no shared history. Rebuild the sync branch on
-          # top of upstream history, then re-apply downstream customizations
-          # as one commit. Once this PR is merged, future syncs use MERGE mode.
-          git checkout -B "${SYNC_BRANCH}" "${HEAD_SHA}"
+          # Snapshot clone — no shared history. Create a merge commit whose
+          # first parent is the downstream default branch and second parent is
+          # the upstream target. GitHub can open this PR because it shares
+          # history with the base branch; after merge, the repo also contains
+          # upstream history and future syncs use MERGE mode.
+          git merge -s ours --allow-unrelated-histories --no-commit "${HEAD_SHA}"
+
+          # Start the merge result from the upstream target tree, then overlay
+          # the downstream default branch as the customization layer. This does
+          # not depend on the possibly-imprecise snapshot base tag.
+          git read-tree --reset -u "${HEAD_SHA}"
 
           # This App intentionally does not request `workflows` permission.
           # Remove upstream workflow files from the sync branch rather than
@@ -303,11 +310,6 @@ runs:
           # write permission on push.
           git rm -r -f --ignore-unmatch .github/workflows
 
-          # Preserve downstream customizations by copying the downstream
-          # default branch tree over the upstream target, excluding workflow
-          # files. This deliberately does not depend on the possibly-imprecise
-          # snapshot base tag; the PR becomes "upstream history + current
-          # downstream tree as one customization commit".
           git checkout "origin/${DEFAULT_BRANCH}" -- .
           git rm -r -f --ignore-unmatch .github/workflows
 
