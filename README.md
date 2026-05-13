@@ -71,6 +71,7 @@ Go to <https://github.com/settings/apps/new> (or your org's `/organizations/<org
 | Webhook → Active | **Unchecked** (we don't need webhooks; cron + dispatch is enough) |
 | Repository permissions → Contents | **Read and write** |
 | Repository permissions → Pull requests | **Read and write** |
+| Repository permissions → Workflows | **Read and write** |
 | Repository permissions → Metadata | **Read-only** (auto-included) |
 | Where can this app be installed | **Any account** (so downstream users can install it) |
 
@@ -210,7 +211,7 @@ When the bot runs against your repo, it:
 
 Conflicts: if `git merge` or the adopt-history customization commit produces conflict markers, the bot still pushes the branch and opens the PR. The PR body lists which files need manual resolution. Resolve them on `chore/sync-upstream` and the workflow will pick up the resolved tree on the next run.
 
-Workflow files: changes under `.github/workflows/` are intentionally excluded from bot-managed commits because updating workflow files requires the GitHub App's `workflows` permission. The bot does not request that permission by default. In adopt-history mode, workflow files are removed from the sync branch so the App can push it safely. If upstream changed workflow files, the PR body links to them and asks you to copy them manually after review.
+Workflow files: changes under `.github/workflows/` are synced like other files. This requires the GitHub App's **Workflows: Read and write** permission.
 
 ---
 
@@ -229,9 +230,10 @@ Workflow files: changes under `.github/workflows/` are intentionally excluded fr
 
 ## Security model
 
-- **Per-target token scoping**: each matrix job mints an installation token via `actions/create-github-app-token@v1` with `repositories:` set to one repo. A leaked token compromises at most one user's repo, not the fleet.
+- **Per-target token scoping**: each matrix job mints an installation token via `actions/create-github-app-token@v1` with `repositories:` set to one repo and explicit `contents`, `pull-requests`, and `workflows` write permissions. A leaked token compromises at most one user's repo, not the fleet.
 - **No webhooks**: the App has webhook disabled. We pull from GitHub on a schedule; we never accept inbound events to a maintained server.
 - **No stored state**: there's no database of "who installed". GitHub is the source of truth; we re-read it every run. Users uninstalling are picked up automatically.
+- **Workflow write access is powerful**: the App can update GitHub Actions workflow files in installed repositories. Only install it on repositories that should receive upstream workflow changes.
 - **The `SYNC_APP_PRIVATE_KEY` secret** is the entire trust anchor. Treat it like a root credential — anyone with the private key can act as the App against every installation. Use repo secrets, not organization-wide, unless you have a reason to broaden.
 
 ---

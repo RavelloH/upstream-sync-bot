@@ -170,13 +170,13 @@ runs:
           MODE=adopt-history
           echo "Snapshot clone detected. Scanning upstream for the best matching tree..."
           BASE_SHA=""
-          # In adopt-history mode, workflow files are never bot-managed and
-          # sync-bot.config.json is normally instance-local. Ignore both while
+          # In adopt-history mode, sync-bot.config.json is normally
+          # instance-local. Ignore it while
           # searching for the upstream commit represented by the downstream
           # tree.
           for sha in $(git rev-list "${SYNC_TARGET_SHA}" --max-count=1000); do
             # shellcheck disable=SC2086
-            if git diff --quiet HEAD "$sha" -- . ${TREE_SCAN_EXCLUDE} ':!.github/workflows/**' ':!sync-bot.config.json'; then
+            if git diff --quiet HEAD "$sha" -- . ${TREE_SCAN_EXCLUDE} ':!sync-bot.config.json'; then
               BASE_SHA="$sha"
               break
             fi
@@ -248,13 +248,6 @@ runs:
 
         HAS_CONFLICTS=false
         CONFLICT_FILES=""
-        MANUAL_WORKFLOW_FILES="$(git diff --name-only "${BASE_SHA}" "${HEAD_SHA}" -- '.github/workflows/**' || true)"
-        if [ -n "${MANUAL_WORKFLOW_FILES}" ]; then
-          echo "Workflow file changes detected. They will be excluded from the bot commit because this App does not request workflows permission."
-          printf '%s\n' "${MANUAL_WORKFLOW_FILES}" > /tmp/manual-workflow-files.txt
-        else
-          : > /tmp/manual-workflow-files.txt
-        fi
 
         if [ "${MODE}" = "merge" ]; then
           # Fork / clean clone — preserve upstream commit history via
@@ -275,14 +268,6 @@ runs:
         Resolve the <<<<<<< markers manually before merging this PR."
           fi
 
-          if [ -n "${MANUAL_WORKFLOW_FILES}" ]; then
-            while IFS= read -r f; do
-              [ -z "$f" ] && continue
-              git checkout "origin/${DEFAULT_BRANCH}" -- "$f" 2>/dev/null || git rm -f --ignore-unmatch "$f"
-            done < /tmp/manual-workflow-files.txt
-            git add -A -- .github/workflows
-            git commit --amend --no-edit --allow-empty
-          fi
         else
           # Snapshot clone — no shared history. Create a merge commit whose
           # first parent is the downstream default branch and second parent is
@@ -297,13 +282,7 @@ runs:
           # template files that should be updated from upstream.
           git read-tree --reset -u "${HEAD_SHA}"
 
-          # This App intentionally does not request `workflows` permission.
-          # Remove upstream workflow files from the sync branch rather than
-          # preserving downstream ones. Keeping them would require workflow
-          # write permission on push.
-          git rm -r -f --ignore-unmatch .github/workflows
-
-          git diff --name-status -z "${BASE_SHA}" "origin/${DEFAULT_BRANCH}" -- . ':(exclude).github/workflows/**' \
+          git diff --name-status -z "${BASE_SHA}" "origin/${DEFAULT_BRANCH}" -- . \
             > /tmp/downstream-customizations.z
           node -e '
             const fs = require("fs");
@@ -326,7 +305,6 @@ runs:
             [ -z "$f" ] && continue
             git checkout "origin/${DEFAULT_BRANCH}" -- "$f" 2>/dev/null || git rm -f --ignore-unmatch "$f"
           done < /tmp/downstream-customization-paths.txt
-          git rm -r -f --ignore-unmatch .github/workflows
 
           git add -A
 
@@ -441,7 +419,7 @@ runs:
         WORKFLOW_URL="${BOT_SERVER_URL}/${BOT_REPOSITORY}/blob/HEAD/.github/workflows/sync-fanout.yml"
 
         TOTAL_COMMITS="$(git rev-list --count --no-merges "${BASE}..${HEAD}")"
-        TOTAL_FILES="$(git diff --name-only "${BASE}..${HEAD}" -- . ':(exclude).github/workflows/**' | wc -l | tr -d ' ')"
+        TOTAL_FILES="$(git diff --name-only "${BASE}..${HEAD}" | wc -l | tr -d ' ')"
 
         if [ "${MODE}" = "merge" ]; then
           BASE_NOTE="via shared git history (\`git merge-base\`)"
@@ -479,18 +457,6 @@ runs:
           echo ""
           echo "> ℹ️ ${MODE_NOTE}"
           echo ""
-
-          if [ -s /tmp/manual-workflow-files.txt ]; then
-            echo "## ⚠️ Workflow files require manual copy"
-            echo ""
-            echo "The upstream changed GitHub Actions workflow files. This bot intentionally does not request the \`workflows\` permission, so those files are excluded from the pushed sync branch. Review and copy these files manually from upstream if you want the workflow changes:"
-            echo ""
-            while IFS= read -r f; do
-              [ -z "$f" ] && continue
-              echo "- [\`${f}\`](https://github.com/${UPSTREAM_REPO}/blob/${HEAD}/${f})"
-            done < /tmp/manual-workflow-files.txt
-            echo ""
-          fi
 
           if [ "${HAS_CONFLICTS}" = "true" ]; then
             echo "## ⚠️ Conflicts detected"
@@ -568,7 +534,7 @@ runs:
           echo ""
           echo "## Files changed"
           echo ""
-          git diff --name-status "${BASE}..${HEAD}" -- . ':(exclude).github/workflows/**' | head -30 | awk -v repo="${UPSTREAM_REPO}" '{
+          git diff --name-status "${BASE}..${HEAD}" | head -30 | awk -v repo="${UPSTREAM_REPO}" '{
             status = $1;
             path = $2;
             label = "changed";

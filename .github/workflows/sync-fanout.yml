@@ -94,6 +94,9 @@ jobs:
           # then only compromises one user, not the whole fleet.
           owner: ${{ matrix.target.owner }}
           repositories: ${{ matrix.target.repo }}
+          permission-contents: write
+          permission-pull-requests: write
+          permission-workflows: write
 
       - name: Sync one target
         uses: ./.github/actions/sync-one
