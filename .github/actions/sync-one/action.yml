@@ -170,13 +170,14 @@ runs:
           MODE=adopt-history
           echo "Snapshot clone detected. Scanning upstream for the best matching tree..."
           BASE_SHA=""
-          # In adopt-history mode, sync-bot.config.json is normally
-          # instance-local. Ignore it while
+          # In adopt-history mode, workflow files may be absent from
+          # Cloudflare snapshot clones, and sync-bot.config.json is normally
+          # instance-local. Ignore both while
           # searching for the upstream commit represented by the downstream
           # tree.
           for sha in $(git rev-list "${SYNC_TARGET_SHA}" --max-count=1000); do
             # shellcheck disable=SC2086
-            if git diff --quiet HEAD "$sha" -- . ${TREE_SCAN_EXCLUDE} ':!sync-bot.config.json'; then
+            if git diff --quiet HEAD "$sha" -- . ${TREE_SCAN_EXCLUDE} ':!.github/workflows/**' ':!sync-bot.config.json'; then
               BASE_SHA="$sha"
               break
             fi
